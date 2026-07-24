@@ -75,9 +75,118 @@ This automated approach minimizes emergency response time, reduces the dependenc
 
 ---
 
-### 📚 Libraries
+## 🚀 Installation and Usage Guide
 
-- **Wire.h** – Enables I²C communication between the ESP32 and MPU6050 sensor.
-- **MPU6050.h** – Interfaces with the MPU6050 accelerometer and gyroscope.
-- **TinyGPSPlus.h** – Parses GPS data received from the Neo-6M module.
-- **Adafruit_NeoPixel.h** – Controls the WS2812 RGB LED for status indication.
+### 📌 Requirements
+
+Before running the project, ensure that the following software and hardware requirements are available.
+
+### 💻 Software Requirements
+
+- **Arduino IDE**
+- **ESP32 Board Package**
+
+### 🔌 Hardware Requirements
+
+- **USB Driver** for ESP32 programming
+- **SIM Card** for GSM-based SMS alerts
+- **GPS Antenna** for accurate location tracking
+
+---
+
+## 📚 Required Libraries
+
+Install the following libraries in Arduino IDE before uploading the code:
+
+- **Wire.h**
+- **MPU6050.h**
+- **TinyGPSPlus.h**
+- **Adafruit_NeoPixel.h**
+
+---
+
+## ⚙️ Setup Steps
+
+Follow these steps to install and run the project:
+
+### 1️⃣ Install Arduino IDE
+
+Download and install Arduino IDE on your computer.
+
+---
+
+### 2️⃣ Install ESP32 Board Package
+
+Add ESP32 board support in Arduino IDE and select the ESP32 development board.
+
+---
+
+### 3️⃣ Install Required Libraries
+
+Install all the required libraries mentioned above using:
+
+```
+Arduino IDE → Sketch → Include Library → Manage Libraries
+```
+
+---
+
+### 4️⃣ Connect Hardware Components
+
+Connect all hardware components according to the circuit diagram provided in this repository.
+
+Components include:
+
+- ESP32 Development Board
+- MPU6050 Accelerometer & Gyroscope
+- Neo-6M GPS Module
+- SIM800L GSM Module
+- WS2812 RGB LED
+- Buzzer
+- Push Button
+
+---
+
+### 5️⃣ Upload Code to ESP32
+
+1. Connect the ESP32 board to the computer using a USB cable.
+2. Open the Arduino code from:
+
+```
+src/SmartBikeAccidentDetection.ino
+```
+
+3. Select the correct ESP32 board and COM port.
+4. Upload the program to the ESP32.
+
+---
+
+### 6️⃣ Power the System
+
+After successful uploading:
+
+- Power the system using the battery supply.
+- Ensure the SIM card is inserted into the SIM800L module.
+- Place the GPS antenna properly for signal reception.
+
+---
+
+### 7️⃣ Test the System
+
+To test accident detection:
+
+- Keep the bike in normal position.
+- Tilt the bike beyond the predefined threshold.
+- Verify the following:
+
+✅ Accident detection is triggered.  
+✅ Buzzer starts warning.  
+✅ RGB LED indicates emergency status.  
+✅ GPS location is obtained.  
+✅ SMS alert is sent through GSM if not cancelled.
+
+---
+
+## ✅ Usage
+
+The system continuously monitors bike movement. When a fall is detected, it automatically alerts emergency contacts with the rider's location, improving safety and reducing emergency response time.
