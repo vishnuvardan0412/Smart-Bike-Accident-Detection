@@ -1,0 +1,290 @@
+/*
+  BIKE TILT / ACCIDENT DETECTION + GPS + SMS ALERT SYSTEM
+  Board: ESP32 DevKit V1
+
+  Hardware:
+    - MPU6050        -> I2C (SDA 21, SCL 22)
+    - NEO-6M GPS     -> Serial2 (RX2=16, TX2=17)
+    - SIM800L GSM    -> Serial1 (RX=26, TX=27) [EXTERNAL 4V/2A POWER REQUIRED]
+    - Buzzer         -> GPIO25
+    - Push Switch    -> GPIO32 (INPUT_PULLUP, pressed = LOW)
+    - WS2812 LED     -> GPIO33 (status indicator: green=normal, red=alarm)
+
+  Libraries required (install via Library Manager):
+    - Adafruit MPU6050
+    - Adafruit Unified Sensor
+    - TinyGPSPlus
+    - Adafruit NeoPixel
+
+  LOGIC:
+    1. Continuously read MPU6050 acceleration.
+    2. If total acceleration magnitude deviates from ~1g (9.8 m/s^2) by more
+       than ACCEL_THRESHOLD, an accident/tilt event is declared.
+    3. Buzzer turns ON, LED turns RED, 60-second countdown starts.
+    4. If the switch is pressed within 60 seconds -> alarm cancelled (false alarm),
+       buzzer OFF, LED back to GREEN.
+    5. If the switch is NOT pressed within 60 seconds -> GPS location is read,
+       a Google Maps link is built, and an SMS is sent via SIM800L to the
+       configured phone number. Buzzer keeps sounding until switch is pressed.
+*/
+
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <TinyGPSPlus.h>
+#include <Adafruit_NeoPixel.h>
+
+// ---------------- CONFIG ----------------
+#define PHONE_NUMBER      "+91XXXXXXXXXX"   // <-- put the emergency contact number here
+#define ANGLE_THRESHOLD    40.0              // degrees away from baseline to count as a potential tilt (tune this)
+#define ANGLE_STABILITY_BAND 6.0             // degrees of wobble allowed while considered "held steady"
+#define TILT_HOLD_MS       2500              // angle must stay steady this long to confirm impact (2-3s)
+#define ALARM_WINDOW_MS   60000              // 60 seconds to cancel before SMS is sent
+
+#define BUZZER_PIN        25
+#define SWITCH_PIN        32
+#define LED_PIN           33
+#define GPS_RX_PIN        16
+#define GPS_TX_PIN        17
+#define SIM_RX_PIN        26
+#define SIM_TX_PIN        27
+
+// ---------------- OBJECTS ----------------
+Adafruit_MPU6050 mpu;
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);   // UART2 for GPS
+HardwareSerial simSerial(1);   // UART1 for SIM800L
+Adafruit_NeoPixel led(1, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// ---------------- STATE ----------------
+bool alarmActive = false;
+unsigned long alarmStartTime = 0;
+bool smsSent = false;
+
+// Debug printout (for tuning ACCEL_THRESHOLD and checking GPS fix)
+unsigned long lastDebugPrint = 0;
+#define DEBUG_INTERVAL_MS 1000
+
+// Sustained tilt-angle detection state
+float baselineAngle = 0;
+bool tiltCandidate = false;
+float candidateAngle = 0;
+unsigned long tiltCandidateStart = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(21, 22);
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found. Check wiring.");
+    while (1) delay(10);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  simSerial.begin(9600, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
+
+  led.begin();
+  led.show();
+  setLED(0, 255, 0); // green = normal
+
+  Serial.println("System ready. Initializing GSM module...");
+  initSIM800L();
+
+  calibrateBaselineAngle();
+}
+
+// -------- Calibrate the normal/upright riding angle at startup --------
+void calibrateBaselineAngle() {
+  Serial.println("Calibrating baseline angle... keep bike upright and still.");
+  float sum = 0;
+  const int samples = 20;
+  for (int i = 0; i < samples; i++) {
+    sum += computeTiltAngle();
+    delay(100);
+  }
+  baselineAngle = sum / samples;
+  Serial.print("Baseline angle set to: ");
+  Serial.println(baselineAngle, 2);
+
+void loop() {
+  // Keep feeding GPS parser
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+
+  if (!alarmActive) {
+    checkForTilt();
+  } else {
+    handleAlarmState();
+  }
+
+  printDebugInfo();
+}
+
+// -------- Live debug printout: tilt angle + GPS fix/coords --------
+void printDebugInfo() {
+  if (millis() - lastDebugPrint < DEBUG_INTERVAL_MS) return;
+  lastDebugPrint = millis();
+
+  float currentAngle = computeTiltAngle();
+  float deviation = abs(currentAngle - baselineAngle);
+
+  Serial.print("ANGLE current=");
+  Serial.print(currentAngle, 1);
+  Serial.print(" baseline=");
+  Serial.print(baselineAngle, 1);
+  Serial.print(" deviation=");
+  Serial.print(deviation, 1);
+  Serial.print(" (threshold=");
+  Serial.print(ANGLE_THRESHOLD, 1);
+  Serial.print(") holding=");
+  Serial.print(tiltCandidate ? "YES" : "NO");
+
+  Serial.print(" | GPS fix=");
+  Serial.print(gps.location.isValid() ? "YES" : "NO");
+  if (gps.location.isValid()) {
+    Serial.print(" lat=");
+    Serial.print(gps.location.lat(), 6);
+    Serial.print(" lng=");
+    Serial.print(gps.location.lng(), 6);
+    Serial.print(" sats=");
+    Serial.print(gps.satellites.value());
+  }
+  Serial.println();
+}
+
+// -------- Compute current tilt angle (degrees from vertical) --------
+float computeTiltAngle() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float totalAccel = sqrt(a.acceleration.x * a.acceleration.x +
+                           a.acceleration.y * a.acceleration.y +
+                           a.acceleration.z * a.acceleration.z);
+  if (totalAccel == 0) return 0;
+  float angle = acos(constrain(a.acceleration.z / totalAccel, -1.0, 1.0)) * 180.0 / PI;
+  return angle;
+}
+
+// -------- Sustained tilt / accident detection --------
+// Once the bike moves away from baseline and HOLDS a new angle for
+// TILT_HOLD_MS, it's declared an impact. No repeated re-verification;
+// only whether the new angle stays steady.
+void checkForTilt() {
+  float currentAngle = computeTiltAngle();
+  float deviationFromBaseline = abs(currentAngle - baselineAngle);
+
+  if (deviationFromBaseline > ANGLE_THRESHOLD) {
+    if (!tiltCandidate) {
+      // First moment we notice a large deviation - start watching this angle
+      tiltCandidate = true;
+      candidateAngle = currentAngle;
+      tiltCandidateStart = millis();
+    } else {
+      // Already watching - check if it's still near the candidate angle (i.e. settled, not still moving)
+      if (abs(currentAngle - candidateAngle) <= ANGLE_STABILITY_BAND) {
+        if (millis() - tiltCandidateStart >= TILT_HOLD_MS) {
+          Serial.println("Sustained tilt confirmed! Declaring impact.");
+          alarmActive = true;
+          smsSent = false;
+          alarmStartTime = millis();
+          digitalWrite(BUZZER_PIN, HIGH);
+          setLED(255, 0, 0); // red = alarm
+          tiltCandidate = false; // reset for next cycle
+        }
+        // else: still holding, keep waiting - no action needed yet
+      } else {
+        // Angle drifted further / still moving - restart the hold window on the new angle
+        candidateAngle = currentAngle;
+        tiltCandidateStart = millis();
+      }
+    }
+  } else {
+    // Back within normal range - cancel any pending candidate (was just a bump)
+    tiltCandidate = false;
+  }
+}
+
+// -------- Alarm countdown / cancel / SMS trigger --------
+void handleAlarmState() {
+  // Switch pressed -> cancel
+  if (digitalRead(SWITCH_PIN) == LOW) {
+    Serial.println("Switch pressed. Alarm cancelled.");
+    resetAlarm();
+    return;
+  }
+
+  unsigned long elapsed = millis() - alarmStartTime;
+
+  if (elapsed >= ALARM_WINDOW_MS && !smsSent) {
+    Serial.println("No response within 60s. Sending SMS alert.");
+    sendAccidentSMS();
+    smsSent = true;
+  }
+
+  // Buzzer keeps sounding after SMS until switch is pressed to reset
+}
+
+void resetAlarm() {
+  alarmActive = false;
+  smsSent = false;
+  digitalWrite(BUZZER_PIN, LOW);
+  setLED(0, 255, 0);
+}
+
+// -------- GPS + Google Maps link --------
+String getGoogleMapsLink() {
+  if (gps.location.isValid()) {
+    String lat = String(gps.location.lat(), 6);
+    String lng = String(gps.location.lng(), 6);
+    return "https://maps.google.com/?q=" + lat + "," + lng;
+  } else {
+    return "Location unavailable (no GPS fix yet)";
+  }
+}
+
+// -------- SIM800L SMS --------
+void initSIM800L() {
+  sendATCommand("AT", 1000);
+  sendATCommand("AT+CMGF=1", 1000);       // Text mode
+  sendATCommand("AT+CNMI=1,2,0,0,0", 1000); // Notify on new SMS (optional)
+}
+
+void sendAccidentSMS() {
+  String link = getGoogleMapsLink();
+  String message = "ACCIDENT ALERT! Possible bike accident detected. Location: " + link;
+
+  simSerial.print("AT+CMGF=1\r");
+  delay(300);
+  simSerial.print("AT+CMGS=\"" + String(PHONE_NUMBER) + "\"\r");
+  delay(300);
+  simSerial.print(message);
+  delay(300);
+  simSerial.write(26); // Ctrl+Z to send
+  delay(3000);
+
+  Serial.println("SMS sent: " + message);
+}
+
+String sendATCommand(String cmd, int waitMs) {
+  simSerial.println(cmd);
+  delay(waitMs);
+  String response = "";
+  while (simSerial.available()) {
+    response += (char)simSerial.read();
+  }
+  Serial.println(response);
+  return response;
+}
+
+// -------- Status LED helper --------
+void setLED(int r, int g, int b) {
+  led.setPixelColor(0, led.Color(r, g, b));
+  led.show();
+}
